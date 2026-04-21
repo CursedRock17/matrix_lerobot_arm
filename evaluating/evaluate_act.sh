@@ -33,13 +33,13 @@ lerobot-record \
 	--robot.port="$ROBOT_PORT" \
 	--robot.cameras="$CAMERA_CONFIG" \
 	--robot.id="$ROBOT_ID" \
-	--display_data=true \
 	--dataset.repo_id=${HF_USER}/eval_${HF_DATASET} \
 	--dataset.single_task="$TASK_DESCRIPTION" \
 	--dataset.episode_time_s=999 \
 	--dataset.reset_time_s=5 \
 	--dataset.num_episodes="$NUM_EPISODES" \
 	--policy.path=${HF_USER}/${HF_POLICY} \
+	#--display_data=true \
 
 
 echo "Evaluation done. Dataset pushed to https://huggingface.co/datasets/$HF_DATASET"
