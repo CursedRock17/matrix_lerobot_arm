@@ -13,7 +13,8 @@ export JOB_NAME=${JOB_NAME:-${HF_DATASET}_smolvla}
 export OUTPUT_DIR=${OUTPUT_DIR:-outputs/train/smolvla_${HF_DATASET}}
 
 lerobot-train \
-    --policy.path=lerobot/smolvla_base \
+    --policy.type=smolvla \
+    --policy.pretrained_path=lerobot/smolvla_base \
     --dataset.repo_id=${HF_USER}/${HF_DATASET} \
     --batch_size=16 \
     --steps=80000 \
