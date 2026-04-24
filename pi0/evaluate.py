@@ -1,7 +1,8 @@
-"""Evaluate a fine-tuned SmolVLA checkpoint with Real-Time Chunking (RTC).
+"""Evaluate a fine-tuned Pi0 checkpoint with Real-Time Chunking (RTC).
 
-RTC can only be used via `predict_action_chunk` + `ActionQueue`, not via
-`select_action`. This script runs two threads:
+Pi0, like SmolVLA, is a flow-matching policy that supports RTC. RTC runs
+through `predict_action_chunk` + `ActionQueue`, not `select_action`, and
+uses two threads:
 
   * get_actions : requests a new chunk whenever the queue drops below a
                   threshold, feeding RTC the leftover prefix of the old chunk
@@ -9,7 +10,7 @@ RTC can only be used via `predict_action_chunk` + `ActionQueue`, not via
   * actor       : pops one action at a time from the queue at FPS and sends
                   it to the robot.
 
-Toggle `RTC_ENABLED = False` to run with the same dual-thread scaffolding but
+Toggle `RTC_ENABLED = False` to run the same dual-thread scaffolding but
 without RTC (`ActionQueue` just appends new chunks instead of inpainting).
 """
 
@@ -23,7 +24,7 @@ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 from lerobot.cameras.configs import ColorMode
 from lerobot.datasets.feature_utils import hw_to_dataset_features
-from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.policies.pi0.modeling_pi0 import PI0Policy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.utils import build_inference_frame, make_robot_action
 from lerobot.policies.rtc.action_queue import ActionQueue
@@ -36,8 +37,8 @@ from lerobot.utils.visualization_utils import init_rerun
 
 # Configuration
 HF_USER = "CursedRock17"
-DATASET_NAME = "so101_block_grab"
-POLICY_PATH = f"{HF_USER}/{DATASET_NAME}_smolvla"
+DATASET_NAME = "so101_block_grab_pi0"
+POLICY_PATH = f"{HF_USER}/{DATASET_NAME}_pi0_0"
 device = torch.device("cuda")
 
 # Evaluation
@@ -53,8 +54,7 @@ QUEUE_THRESHOLD = 15             # request new chunk when queue <= this many act
 MAX_GUIDANCE_WEIGHT = 10.0       # how strongly to enforce consistency
 
 # Rates: cameras stream at CAMERA_FPS, the arm is driven at CONTROL_FPS.
-# Keep them separate because the laptop GPU can struggle to hold a 30 Hz
-# send-action loop; 10 Hz (100 ms per action) is plenty for a block grab.
+# Pi0 inference is slower than SmolVLA; 10 Hz control is well within budget.
 CAMERA_FPS = 30
 CONTROL_FPS = 10
 FRAME_W, FRAME_H = 640, 480
@@ -84,31 +84,29 @@ follower_config = SO101FollowerConfig(
 follower = SO101Follower(follower_config)
 
 # Policy + RTC wiring
-policy = SmolVLAPolicy.from_pretrained(POLICY_PATH)
+policy = PI0Policy.from_pretrained(POLICY_PATH)
 policy.config.rtc_config = RTCConfig(
     enabled=RTC_ENABLED,
     execution_horizon=EXECUTION_HORIZON,
-    max_guidance_weight=MAX_GUIDANCE_WEIGHT
+    max_guidance_weight=MAX_GUIDANCE_WEIGHT,
 )
 policy.init_rtc_processor()
 policy.to(device)
 policy.eval()
 
-# Extracting Features from the Dataset
 action_features = hw_to_dataset_features(follower.action_features, "action")
 obs_features = hw_to_dataset_features(follower.observation_features, "observation")
 dataset_features = {**action_features, **obs_features}
 
-# Correct Processing Unit
 preprocessor, postprocessor = make_pre_post_processors(
     policy_cfg=policy.config,
     pretrained_path=POLICY_PATH,
-    dataset_stats=None,  # stats are embedded in the checkpoint's processor files
+    dataset_stats=None,
     preprocessor_overrides={"device_processor": {"device": str(device)}},
 )
 
 _, events = init_keyboard_listener()
-init_rerun(session_name="smolvla_eval_rtc")
+init_rerun(session_name="pi0_eval_rtc")
 
 # Queue holds pending actions for the actor thread to consume.
 action_queue = ActionQueue(policy.config.rtc_config)
@@ -138,7 +136,7 @@ def get_actions_loop():
         t0 = time.perf_counter()
         # Grab latest camera frames + joint state from the follower.
         obs = follower.get_observation()
-        # Assemble the dict SmolVLA expects (tokenized task, normalized tensors).
+        # Assemble the dict Pi0 expects (tokenized task, normalized image tensors).
         obs_frame = build_inference_frame(
             observation=obs,
             ds_features=dataset_features,

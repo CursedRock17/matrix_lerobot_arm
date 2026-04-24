@@ -1,3 +1,6 @@
 [submodule "lerobot"]
 	path = lerobot
 	url = https://github.com/huggingface/lerobot.git
+[submodule "physical-AI-interpretability"]
+	path = physical-AI-interpretability
+	url = https://github.com/villekuosmanen/physical-AI-interpretability.git

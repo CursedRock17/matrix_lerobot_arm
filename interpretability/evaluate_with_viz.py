@@ -1,22 +1,24 @@
-"""Evaluate a fine-tuned SmolVLA checkpoint with Real-Time Chunking (RTC).
+"""Evaluate SmolVLA with Real-Time Chunking AND attention overlays.
 
-RTC can only be used via `predict_action_chunk` + `ActionQueue`, not via
-`select_action`. This script runs two threads:
+Mirrors `smolvla/evaluate.py` but wraps the policy with a
+`VisionAttentionCapture` on the SigLIP vision encoder. After every chunk
+request we log an attention-rollout heatmap per camera to rerun, so you can
+watch where the vision encoder is focused while the policy drives the arm.
 
-  * get_actions : requests a new chunk whenever the queue drops below a
-                  threshold, feeding RTC the leftover prefix of the old chunk
-                  so the new chunk blends smoothly with actions already sent.
-  * actor       : pops one action at a time from the queue at FPS and sends
-                  it to the robot.
-
-Toggle `RTC_ENABLED = False` to run with the same dual-thread scaffolding but
-without RTC (`ActionQueue` just appends new chunks instead of inpainting).
+This is a read-only extension — toggling the capture off (set
+ATTENTION_ENABLED = False) gives you the same control loop as smolvla/evaluate.py.
 """
+
+from __future__ import annotations
 
 import math
 import threading
 import time
+from pathlib import Path
+import sys
 
+import numpy as np
+import rerun as rr
 import torch
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
@@ -34,6 +36,14 @@ from lerobot.utils.control_utils import init_keyboard_listener
 from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import init_rerun
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from interpretability import (
+    VisionAttentionCapture,
+    log_attention_overlay,
+    patch_heatmap_to_image,
+    rollout_to_patch_heatmap,
+)
+
 # Configuration
 HF_USER = "CursedRock17"
 DATASET_NAME = "so101_block_grab"
@@ -48,18 +58,20 @@ ROBOT_TYPE = "so101_follower"
 
 # RTC
 RTC_ENABLED = True
-EXECUTION_HORIZON = 10           # how many overlapping steps to blend
-QUEUE_THRESHOLD = 15             # request new chunk when queue <= this many actions
-MAX_GUIDANCE_WEIGHT = 10.0       # how strongly to enforce consistency
+EXECUTION_HORIZON = 10
+QUEUE_THRESHOLD = 15
+MAX_GUIDANCE_WEIGHT = 10.0
+
+# Attention visualization — flip off to run a plain RTC loop.
+ATTENTION_ENABLED = True
 
 # Rates: cameras stream at CAMERA_FPS, the arm is driven at CONTROL_FPS.
-# Keep them separate because the laptop GPU can struggle to hold a 30 Hz
-# send-action loop; 10 Hz (100 ms per action) is plenty for a block grab.
+# Capture adds a matmul+softmax per ViT layer per chunk on top of the VLM
+# forward, so lower control rate keeps the laptop GPU comfortable.
 CAMERA_FPS = 30
 CONTROL_FPS = 10
 FRAME_W, FRAME_H = 640, 480
 
-# SO101 Follower Arm Setup
 follower_config = SO101FollowerConfig(
     port="/dev/ttyACM1",
     id="Raven",
@@ -83,32 +95,29 @@ follower_config = SO101FollowerConfig(
 )
 follower = SO101Follower(follower_config)
 
-# Policy + RTC wiring
 policy = SmolVLAPolicy.from_pretrained(POLICY_PATH)
 policy.config.rtc_config = RTCConfig(
     enabled=RTC_ENABLED,
     execution_horizon=EXECUTION_HORIZON,
-    max_guidance_weight=MAX_GUIDANCE_WEIGHT
+    max_guidance_weight=MAX_GUIDANCE_WEIGHT,
 )
 policy.init_rtc_processor()
 policy.to(device)
 policy.eval()
 
-# Extracting Features from the Dataset
 action_features = hw_to_dataset_features(follower.action_features, "action")
 obs_features = hw_to_dataset_features(follower.observation_features, "observation")
 dataset_features = {**action_features, **obs_features}
 
-# Correct Processing Unit
 preprocessor, postprocessor = make_pre_post_processors(
     policy_cfg=policy.config,
     pretrained_path=POLICY_PATH,
-    dataset_stats=None,  # stats are embedded in the checkpoint's processor files
+    dataset_stats=None,
     preprocessor_overrides={"device_processor": {"device": str(device)}},
 )
 
 _, events = init_keyboard_listener()
-init_rerun(session_name="smolvla_eval_rtc")
+init_rerun(session_name="smolvla_eval_rtc_viz")
 
 # Queue holds pending actions for the actor thread to consume.
 action_queue = ActionQueue(policy.config.rtc_config)
@@ -118,12 +127,57 @@ latency_tracker = LatencyTracker(maxlen=20)
 time_per_chunk = 1.0 / CONTROL_FPS
 shutdown_event = threading.Event()
 
+# SigLIP encoder inside the VLM — this is where we hook Q/K projections.
+vision_model = policy.model.vlm_with_expert.get_vlm_model().vision_model
+capture = VisionAttentionCapture(vision_model)
+# Holds the original embed_image bound method so we can restore it on shutdown.
+_orig_embed_image = None
+
+
+def _camera_keys_in_policy_order() -> list[str]:
+    """Return the raw camera keys (e.g. "top", "wrist.top") in the same order
+    `prepare_images` feeds them into the vision encoder."""
+    prefix = "observation.images."
+    keys = []
+    for k in policy.config.image_features:
+        if k.startswith(prefix):
+            keys.append(k[len(prefix) :])
+    return keys
+
+
+def _log_attention_for_obs(obs: dict) -> None:
+    """Consume capture.rollouts (one entry per camera) and overlay on the raw
+    camera images. Must be called exactly once per predict_action_chunk."""
+    # Camera order here matches the order embed_image was called during forward.
+    camera_keys = _camera_keys_in_policy_order()
+    if len(capture.rollouts) != len(camera_keys):
+        # Fewer rollouts than cameras — usually means a hook was missed. Skip
+        # this frame rather than misalign the overlay.
+        capture.rollouts.clear()
+        return
+
+    for cam_key, rollout in zip(camera_keys, capture.rollouts, strict=True):
+        # Raw obs dict uses the bare camera name ("top"), not the feature key.
+        image = obs.get(cam_key)
+        if image is None:
+            continue
+        if not isinstance(image, np.ndarray) or image.dtype != np.uint8:
+            continue
+
+        # (seq, seq) rollout → (patch_h, patch_w) per-patch importance.
+        patch_heat = rollout_to_patch_heatmap(rollout)
+        # Upsample the patch grid to the full camera resolution for overlay.
+        heat = patch_heatmap_to_image(patch_heat, target_hw=image.shape[:2])
+        log_attention_overlay(f"attention/{cam_key}", image, heat)
+
+    capture.rollouts.clear()
+
 
 def get_actions_loop():
-    """Background thread: keep the action queue filled via RTC."""
-    # With RTC off, we only refill when the queue is fully empty.
-    threshold = QUEUE_THRESHOLD if RTC_ENABLED else 0
+    """Producer: refill the action queue via RTC, then log per-camera attention."""
     while not shutdown_event.is_set():
+        # With RTC off, we only refill when the queue is fully empty.
+        threshold = QUEUE_THRESHOLD if RTC_ENABLED else 0
         # Skip if queue still has enough buffered actions.
         if action_queue.qsize() > threshold:
             time.sleep(0.01)
@@ -148,7 +202,7 @@ def get_actions_loop():
         )
         obs_frame = preprocessor(obs_frame)
 
-        # Flow-matching denoise a new chunk, conditioned on the leftover prefix.
+        # Each embed_image call inside this forward triggers capture.snapshot().
         actions = policy.predict_action_chunk(
             obs_frame,
             inference_delay=inference_delay,
@@ -165,9 +219,13 @@ def get_actions_loop():
         # RTC blends the new chunk into the queue at the correct offset.
         action_queue.merge(original_actions, post_actions, real_delay, idx_before)
 
+        # Overlay the captured rollouts on the raw camera frames via rerun.
+        if ATTENTION_ENABLED:
+            _log_attention_for_obs(obs)
+
 
 def actor_loop():
-    """Background thread: pop actions and send them to the robot at CONTROL_FPS."""
+    """Consumer: pop one action at a time at CONTROL_FPS and send it to the robot."""
     # Target wall-clock budget per action (0.1s at 10Hz).
     interval = 1.0 / CONTROL_FPS
     while not shutdown_event.is_set():
@@ -184,14 +242,35 @@ def actor_loop():
 
 
 follower.connect()
-log_say(f"Robot connected. RTC={'on' if RTC_ENABLED else 'off'}")
-
-inference_thread = threading.Thread(target=get_actions_loop, daemon=True)
-control_thread = threading.Thread(target=actor_loop, daemon=True)
-inference_thread.start()
-control_thread.start()
+log_say(
+    f"Robot connected. RTC={'on' if RTC_ENABLED else 'off'} "
+    f"attention={'on' if ATTENTION_ENABLED else 'off'}"
+)
 
 try:
+    if ATTENTION_ENABLED:
+        # Install q_proj / k_proj forward hooks on every SigLIP attention layer.
+        capture.__enter__()
+
+        # `embed_image` is a method on SmolVLMWithExpertModel, not an nn.Module
+        # submodule, so forward_hook doesn't apply — monkey-patch the bound
+        # method. After each call (one per camera per chunk) we snapshot the
+        # rollout and reset the Q/K cache.
+        _orig_embed_image = policy.model.vlm_with_expert.embed_image
+
+        def _patched_embed_image(image):
+            # Run the original encoder forward, then freeze its attention rollout.
+            out = _orig_embed_image(image)
+            capture.snapshot()
+            return out
+
+        policy.model.vlm_with_expert.embed_image = _patched_embed_image
+
+    inference_thread = threading.Thread(target=get_actions_loop, daemon=True)
+    control_thread = threading.Thread(target=actor_loop, daemon=True)
+    inference_thread.start()
+    control_thread.start()
+
     for episode_idx in range(NUM_EPISODES):
         if events["stop_recording"]:
             break
@@ -208,7 +287,13 @@ except KeyboardInterrupt:
 
 finally:
     shutdown_event.set()
-    inference_thread.join(timeout=5.0)
-    control_thread.join(timeout=5.0)
+    try:
+        inference_thread.join(timeout=5.0)
+        control_thread.join(timeout=5.0)
+    except NameError:
+        pass
+    if ATTENTION_ENABLED and _orig_embed_image is not None:
+        policy.model.vlm_with_expert.embed_image = _orig_embed_image
+        capture.__exit__(None, None, None)
     follower.disconnect()
     log_say("Evaluation finished")
